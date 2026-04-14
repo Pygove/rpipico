@@ -6,7 +6,7 @@ from collections import OrderedDict
 import guardar_param
 
 d = dht.DHT22(machine.Pin(15))
-rele = machine.Pin(16, machine.Pin.OUT)
+rele = machine.Pin(14, machine.Pin.OUT)
 rele.value(1)  # Inicia desactivado
 led = machine.Pin("LED", machine.Pin.OUT)
 destello_event = asyncio.Event()
