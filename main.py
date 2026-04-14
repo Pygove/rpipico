@@ -28,6 +28,21 @@ async def destello():
             led.value(0)
             await asyncio.sleep_ms(250)
         print("DESTELLO TERMINADO")
+        
+async def control_rele():
+    while True:
+        params = guardar_param.leer_params()
+        temperatura_actual = d.temperature()
+        
+        if params["modo"] == "AUTO":
+            if temperatura_actual > params["setpoint"]:
+                rele.value(0)  # Activa el relé
+            else:
+                rele.value(1)  # Desactiva el relé
+        elif params["modo"] == "MANUAL":
+            rele.value(0) if params["rele"] else rele.value(1)
+        
+        await asyncio.sleep(1)
 
 async def messages(client):
     async for topic, msg, retained in client.queue:
@@ -93,48 +108,43 @@ async def up(client):  # Respond to connectivity being (re)established
         await client.subscribe('e6614c311b912b31/modo', 1)  # renew subscriptions
         await client.subscribe('e6614c311b912b31/rele', 1)  # renew subscriptions
 
-async def main(client):
-    await client.connect()
-    for coroutine in (up, messages):
-        asyncio.create_task(coroutine(client))
-    asyncio.create_task(destello())
-
+async def publicar(client):
     while True:
         try:
             params = guardar_param.leer_params()
             d.measure()
             try:
-                temperatura=d.temperature()
-            except OSError as e:
+                temperatura = d.temperature()
+            except OSError:
                 print("sin sensor temperatura")
             try:
-                humedad=d.humidity()
-            except OSError as e:
+                humedad = d.humidity()
+            except OSError:
                 print("sin sensor humedad")
-            
-            if params["modo"] == "AUTO":
-                if temperatura > params["setpoint"]:
-                    rele.value(0)  # Activa el relé
-                else:
-                    rele.value(1)  # Desactiva el relé
-            elif params["modo"] == "MANUAL":
-                if params["rele"]:
-                    rele.value(0)  # Activa el relé
-                else:
-                    rele.value(1)  # Desactiva el relé
-            
-            datos=json.dumps(OrderedDict([
-                ('temperatura',temperatura),
-                ('humedad',humedad),
-                ('setpoint',params["setpoint"]),
-                ('periodo',params["periodo"]),
-                ('modo',params["modo"])
-            ]))
-            await client.publish('e6614c311b912b31', datos, qos = 1)
 
-        except OSError as e:
+            datos = json.dumps(OrderedDict([
+                ('temperatura', temperatura),
+                ('humedad', humedad),
+                ('setpoint', params["setpoint"]),
+                ('periodo', params["periodo"]),
+                ('modo', params["modo"])
+            ]))
+            await client.publish('e6614c311b912b31', datos, qos=1)
+            await asyncio.sleep(params["periodo"])
+
+        except OSError:
             print("sin sensor")
-        await asyncio.sleep(params["periodo"]) 
+            await asyncio.sleep(10)
+
+async def main(client):
+    await client.connect()
+    for coroutine in (up, messages, publicar):
+        asyncio.create_task(coroutine(client))
+    asyncio.create_task(destello())
+    asyncio.create_task(control_rele())
+
+    while True:
+        await asyncio.sleep(60) 
 
 config["queue_len"] = 1  # Use event interface with default queue size
 MQTTClient.DEBUG = True  # Optional: print diagnostic messages
