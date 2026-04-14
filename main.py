@@ -1,69 +1,145 @@
-# (C) Copyright Peter Hinch 2017-2019.
-# Released under the MIT licence.
+from mqtt_as import MQTTClient, config
+import asyncio
+from settings import SSID, password, BROKER, PORT
+import dht, machine, json
+from collections import OrderedDict
+import guardar_param
 
-# This demo publishes to topic "result" and also subscribes to that topic.
-# This demonstrates bidirectional TLS communication.
-# You can also run the following on a PC to verify:
-# mosquitto_sub -h test.mosquitto.org -t result
-# To get mosquitto_sub to use a secure connection use this, offered by @gmrza:
-# mosquitto_sub -h <my local mosquitto server> -t result -u <username> -P <password> -p 8883
+d = dht.DHT22(machine.Pin(15))
+rele = machine.Pin(16, machine.Pin.OUT)
+rele.value(1)  # Inicia desactivado
+led = machine.Pin("LED", machine.Pin.OUT)
+destello_event = asyncio.Event()
+# Local configuration
+config['server'] = BROKER 
+config['ssid'] = SSID
+config['port'] = PORT
+config['wifi_pw'] = password
+config['ssl'] = True
 
-# Public brokers https://github.com/mqtt/mqtt.github.io/wiki/public_brokers
+async def destello():
+    while True:
+        await destello_event.wait()
+        destello_event.clear()
+        print("INICIANDO DESTELLO")
+        for i in range(10):
+            led.value(1)
+            await asyncio.sleep_ms(250)
+            led.value(0)
+            await asyncio.sleep_ms(250)
+        print("DESTELLO TERMINADO")
 
-# red LED: ON == WiFi fail
-# green LED heartbeat: demonstrates scheduler is running.
+async def messages(client):
+    async for topic, msg, retained in client.queue:
+        t = topic.decode()
+        m = msg.decode()
+        print(f'Topic: "{t}" Message: "{m}" Retained: {retained}')
+        
+        if t == 'e6614c311b912b31/destello':
+            destello_event.set()
 
-from mqtt_as import MQTTClient
-from mqtt_local import config
-import uasyncio as asyncio
-import dht, machine
+        elif t == 'e6614c311b912b31/setpoint':
+            try:
+                dato = json.loads(m)           
+                guardar_param.actualizar_parametro("setpoint", float(dato["msg"]))
+                print(f"Setpoint actualizado: {m}")
+            except ValueError:
+                print(f"Setpoint inválido: {m}")
+        
+        elif t == 'e6614c311b912b31/modo':
+            try:
+                dato = json.loads(m)
+                valor = dato["msg"]
+                if valor in ("AUTO", "MANUAL"):
+                    guardar_param.actualizar_parametro("modo", valor)
+                    print(f"Modo actualizado: {valor}")
+                else:
+                    print(f"Modo inválido: {valor}")
+            except (ValueError, KeyError):
+                print(f"Modo inválido: {m}")
+            
+        elif t == 'e6614c311b912b31/rele':
+            try:
+                dato = json.loads(m)
+                valor = str(dato["msg"])
+                if valor in ("True", "False"):
+                    guardar_param.actualizar_parametro("rele", valor == "True")
+                    print(f"Relé actualizado: {valor}")
+                else:
+                    print(f"Relé inválido: {valor}")
+            except (ValueError, KeyError):
+                print(f"Relé inválido: {m}")
 
-d = dht.DHT22(machine.Pin(13))
+        elif t == 'e6614c311b912b31/periodo':
+            try:
+                dato = json.loads(m)
+                valor = int(dato["msg"])
+                if valor>=0:
+                    guardar_param.actualizar_parametro("periodo", valor)
+                    print(f"Periodo actualizado: {valor}")
+                else:
+                    print(f"Periodo inválido: {valor}")
+            except (ValueError, KeyError):
+                print(f"Periodo inválido: {m}")
 
-def sub_cb(topic, msg, retained):
-    print('Topic = {} -> Valor = {}'.format(topic.decode(), msg.decode()))
-
-async def wifi_han(state):
-    print('Wifi is ', 'up' if state else 'down')
-    await asyncio.sleep(1)
-
-# If you connect with clean_session True, must re-subscribe (MQTT spec 3.1.2.4)
-async def conn_han(client):
-    await client.subscribe('topico/temperatura', 1)
-    await client.subscribe('topico/humedad', 1)
+async def up(client):  # Respond to connectivity being (re)established
+    while True:
+        await client.up.wait()  # Wait on an Event
+        client.up.clear()
+        await client.subscribe('e6614c311b912b31', 1)  # renew subscriptions
+        await client.subscribe('e6614c311b912b31/setpoint', 1)  # renew subscriptions
+        await client.subscribe('e6614c311b912b31/periodo', 1)  # renew subscriptions
+        await client.subscribe('e6614c311b912b31/destello', 1)  # renew subscriptions
+        await client.subscribe('e6614c311b912b31/modo', 1)  # renew subscriptions
+        await client.subscribe('e6614c311b912b31/rele', 1)  # renew subscriptions
 
 async def main(client):
     await client.connect()
-    n = 0
-    await asyncio.sleep(2)  # Give broker time
+    for coroutine in (up, messages):
+        asyncio.create_task(coroutine(client))
+    asyncio.create_task(destello())
+
     while True:
         try:
+            params = guardar_param.leer_params()
             d.measure()
             try:
                 temperatura=d.temperature()
-                await client.publish('topico/temperatura', '{}'.format(temperatura), qos = 1)
             except OSError as e:
                 print("sin sensor temperatura")
             try:
                 humedad=d.humidity()
-                await client.publish('topico/humedad', '{}'.format(humedad), qos = 1)
             except OSError as e:
                 print("sin sensor humedad")
+            
+            if params["modo"] == "AUTO":
+                if temperatura > params["setpoint"]:
+                    rele.value(0)  # Activa el relé
+                else:
+                    rele.value(1)  # Desactiva el relé
+            elif params["modo"] == "MANUAL":
+                if params["rele"]:
+                    rele.value(0)  # Activa el relé
+                else:
+                    rele.value(1)  # Desactiva el relé
+            
+            datos=json.dumps(OrderedDict([
+                ('temperatura',temperatura),
+                ('humedad',humedad),
+                ('setpoint',params["setpoint"]),
+                ('periodo',params["periodo"]),
+                ('modo',params["modo"])
+            ]))
+            await client.publish('e6614c311b912b31', datos, qos = 1)
+
         except OSError as e:
             print("sin sensor")
-        await asyncio.sleep(20)  # Broker is slow
+        await asyncio.sleep(params["periodo"]) 
 
-# Define configuration
-config['subs_cb'] = sub_cb
-config['connect_coro'] = conn_han
-config['wifi_coro'] = wifi_han
-config['ssl'] = True
-
-# Set up client
-MQTTClient.DEBUG = True  # Optional
+config["queue_len"] = 1  # Use event interface with default queue size
+MQTTClient.DEBUG = True  # Optional: print diagnostic messages
 client = MQTTClient(config)
 try:
     asyncio.run(main(client))
 finally:
-    client.close()
-    asyncio.new_event_loop()
+    client.close()  # Prevent LmacRxBlk:1 errors
